@@ -1,0 +1,15 @@
+kcc by Kaedenn
+
+This program makes the daily life of a C, C++ or assembly programmer a tad
+bit easier, by supplying quick, intuitive and friendly shortcuts to many of
+gcc's facilities. Although this is far from a complete build system or a
+replacement for Makefiles, kcc is meant for smaller programs with fewer
+source files; it's not suited for large projects.
+
+Although this program will run standalone with no non-standard utilities,
+the magic of this program comes from the optional kaedenn.errmsg and
+kaedenn.gcc modules. If supplied and with the proper configuration of
+environment variables, compiler results from gcc will be printed in color,
+allowing easier viewing of large sets of compiler errors.
+
+For further information, invoke this program with the -h or --help option.
