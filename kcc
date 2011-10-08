@@ -1,0 +1,607 @@
+#!/usr/bin/env python
+
+"""
+kcc: Kaedenn's wrapper around gcc, encapsulating many of its commonly-used
+options and features.
+
+This program makes the daily life of a C, C++ or assembly programmer a tad
+bit easier, by supplying quick, intuitive and friendly shortcuts to many of
+gcc's facilities. Although this is far from a complete build system or a
+replacement for Makefiles, kcc is meant for smaller programs with fewer
+source files; it's not suited for large projects.
+
+Although this program will run standalone with no non-standard utilities,
+the magic of this program comes from the optional kaedenn.errmsg and
+kaedenn.gcc modules. If supplied and with the proper configuration of
+environment variables, compiler results from gcc will be printed in color,
+allowing easier viewing of large sets of compiler errors.
+
+For further information, invoke this program with the -h or --help option.
+"""
+
+# FIXME: no handling of kcc *.o
+
+import optparse
+from subprocess import Popen, STDOUT, PIPE
+import os
+import sys
+
+try:
+  import kaedenn.errmsg
+  import kaedenn.gcc.formatter
+except ImportError, e:
+  try:
+    import imp
+    imp.load_package("kaedenn", "kaedenn")
+    kaedenn.errmsg
+    kaedenn.gcc.formatter
+  except AttributeError, e:
+    KCC_STANDALONE = True
+  else:
+    KCC_STANDALONE = False
+else:
+  KCC_STANDALONE = False
+
+windows = (os.name == "nt")
+macosx = (os.name == "mac")
+linux = (os.name == "posix")
+
+def newext(filename, newext):
+  return os.path.extsep.join((os.path.splitext(filename)[0], newext))
+
+if windows:
+  def decode(*strings):
+    return tuple(s.decode("UTF-16", "replace") for s in strings)
+  def encode(*strings):
+    return tuple(s.encode("UTF-16", "replace") for s in strings)
+else:
+  def decode(*strings):
+    return tuple(s.decode("UTF-8", "replace") for s in strings)
+  def encode(*strings):
+    return tuple(s.encode("UTF-8", "replace") for s in strings)
+
+USAGE_STRING = "usage: %prog [OPTIONS] FILE [FILE, ...] [ -- ARGUMENTS]"
+
+DESCRIPTION_STRING = \
+"""This program has three main features: (1) provide a convenient, intuitive
+wrapper to gcc, under the "Do What I Mean" idea, (2) if kaedenn.errmsg is
+available, print errors, warnings, messages and notifications in their own
+individual colors, and (3) if kaedenn.gcc is available and if the "beautify"
+option is specified, simplify the error messages, removing unnecessary cruft.
+"""
+
+GDB_HELP_STRING = \
+"""Pass the option '-g' to kcc to have a program debugged with gdb.
+  The following commands should be useful:
+    
+    run                     begin execution of the program
+    break <f>:<l>           set a breakpoint at a specific line
+    up                      move up one level in the call stack
+    print <v>               dump information about a specific variable
+    backtrace               print a backtrace (call stack)
+    info registers          print the contents of the integral registers
+    info all-registers      print the contents of all registers
+    info args               print function arguments stored on the stack
+    info scope <f>:<l>      list all variables currently in scope
+    info variables          list every variable known by gdb
+  
+  where the above symbols have the following meanings:
+    <f>: filename
+    <l>: line number
+    <v>: variable name
+"""
+
+LANG_ASM = "asm"
+LANG_C = "c"
+LANG_C99 = "c99"
+LANG_CPP = "c++"
+LANG_CPP1X = "c++1x"
+LANG_FLEX = "flex"
+LANG_NONE = "none"
+
+class KCCOptionParser(object):
+  """KCCOptionParser: figure out what the user wants to do
+  
+  This is the first of the two work-horses for kcc. This class manages all of
+  the options and their possible values, and provides a simple interface for
+  dealing with them.
+  
+  Exports the following members:
+  
+  self.options() -> list
+    returns a list of the options currently supported
+  
+  self.check(option, value = None, has_changed = False) -> bool
+    check to see if an option is True or False
+    if value is not None, check the option against the value
+    if has_changed is True, check to see if the option has been supplied
+  
+  self.get(option) -> value
+    get the value of a specific option, or its default value if the option was
+    not supplied
+  
+  self.parse_args() -> files, program_arguments
+    parse sys.argv, returning a list of files for kcc to compile and other
+    arguments to be ignored by kcc, to be passed to any finishing program
+  """
+  def __init__(self):
+    self._ordered_options = (
+      "compile", "nocolors", "execute", "shared", "compile_proper",
+      "preprocess", "debug", "optimize", "gdbhelp", "nowarn", "lang", "0x",
+      "1x", "beautify", "dest", "passopts", "verbose", "libs", "lgtk",
+      "lgtkmm", "valgrind", "test"
+    )
+    self._options = {
+      "compile": {
+        "default": False,
+        "opts": ("-c", "--compile"),
+        "action": "store_true",
+        "help": "compile the source files to object files; do not link"
+      },
+      "nocolors": {
+        "default": False,
+        "opts": ("-C", "--no-colors"),
+        "action": "store_true",
+        "help": "prevent kcc from printing in color"
+      },
+      "execute": {
+        "default": False,
+        "opts": ("-e", ""),
+        "action": "store_true",
+        "help": "execute the final application after compilation"
+      },
+      "shared": {
+        "default": False,
+        "opts": ("-s", "--shared"),
+        "action": "store_true",
+        "help": "create a shared-object rather than an executable (note: this"
+                " will only work on Unix-based or Linux-based operating"
+                " systems)"
+      },
+      "compile_proper": {
+        "default": False,
+        "opts": ("-S", "--compile-proper"),
+        "action": "store_true",
+        "help": "generate assembly listing but do not assemble"
+      },
+      "preprocess": {
+        "default": False,
+        "opts": ("-E", "--preprocess"),
+        "action": "store_true",
+        "help": "preprocess the source files; do not generate assembly"
+      },
+      "debug": {
+        "default": False,
+        "opts": ("-g", "--debug"),
+        "action": "store_true",
+        "help": "compile with debugging symbols and debug with gdb"
+      },
+      "optimize": {
+        "default": False,
+        "opts": ("-O", "--optimize"),
+        "action": "store_true",
+        "help": "optimize the hell out of the resulting program"
+      },
+      "gdbhelp": {
+        "default": False,
+        "opts": ("-G", "--gdb-help"),
+        "action": "store_true",
+        "help": "print some basic information on how to use gdb and quit"
+      },
+      "nowarn": {
+        "default": False,
+        "opts": ("-w", "--no-warnings"),
+        "action": "store_true",
+        "help": "silence all warnings produced by kcc or the compiler"
+      },
+      "lang": {
+        "default": LANG_NONE,
+        "opts": ("-x", "--lang"),
+        "type": "choice",
+        "choices": ["asm", "c", "c89", "c99", "cpp", "c++", "c++0x", "c++1x",
+                    "flex", "none"],
+        "metavar": "LANGUAGE",
+        "help": "specify a language; possible values: asm, c, c89, c99, c++,"
+                " c++0x, c++1x, flex and none (note: c++0x and c++1x are"
+                " identical, as are c and c89)"
+      },
+      "0x": {
+        "default": False,
+        "opts": ("", "--0x"),
+        "action": "store_true",
+        "help": "alias for -x c++0x"
+      },
+      "1x": {
+        "default": False,
+        "opts": ("", "--1x"),
+        "action": "store_true",
+        "help": "alias for -x c++1x"
+      },
+      "beautify": {
+        "default": False,
+        "opts": ("-b", "--beautify"),
+        "action": "count",
+        "help": "beautify gcc's error messages to make them more readable"
+                " (specify once for basic replacements, twice to remove some"
+                " templates from the output, which may or may not be useful)"
+      },
+      "dest": {
+        "default": "",
+        "opts": ("-o", ""),
+        "metavar": "FILENAME",
+        "help": "manually specify the destination file name"
+      },
+      "passopts": {
+        "default": "",
+        "opts": ("-p", ""),
+        "metavar": "OPTIONS",
+        "help": "pass extra options to gcc; options should be in quotes"
+      },
+      "verbose": {
+        "default": False,
+        "opts": ("-v", "--verbose"),
+        "action": "store_true",
+        "help": "print a ton of information to stderr"
+      },
+      "libs": {
+        "default": [],
+        "opts": ("-l", ""),
+        "action": "append",
+        "metavar": "LIBRARY",
+        "help": "link an additional library; use more than once to link"
+                ' multiple libraries (note: equivalent to -p "-l LIBRARY")'
+      },
+      "lgtk": {
+        "default": False,
+        "opts": ("", "--lgtk"),
+        "action": "store_true",
+        "help": "pass the result of 'pkg-config --cflags --libs gtk+-2.0' to"
+                " gcc"
+      },
+      "lgtkmm": {
+        "default": False,
+        "opts": ("", "--lgtkmm"),
+        "action": "store_true",
+        "help": "pass the result of 'pkg-config --cflags --libs gtkmm-2.4' to"
+                " gcc"
+      },
+      "valgrind": {
+        "default": False,
+        "opts": ("", "--valgrind"),
+        "action": "store_true",
+        "help": "execute the resulting program through valgrind"
+      },
+      "test": {
+        "default": False,
+        "opts": ("-t", "--test"),
+        "action": "store_true",
+        "help": "just check if the source files compile and link"
+      }
+    }
+    self._parser = optparse.OptionParser(usage = USAGE_STRING,
+                                         description = DESCRIPTION_STRING)
+    for opt in self._ordered_options:
+      values = self._options[opt]
+      args = []
+      kwargs = {}
+      arg_names = ("action", "type", "nargs", "help", "choices", "metavar")
+      if values["opts"][0]:
+        args.append(values["opts"][0])
+      if values["opts"][1]:
+        args.append(values["opts"][1])
+      kwargs["dest"] = opt
+      for arg in arg_names:
+        if arg in values:
+          kwargs[arg] = values[arg]
+      self._parser.add_option(*args, **kwargs)
+    defaults = {}
+    for opt in self._options:
+      defaults[opt] = self._options[opt]["default"]
+    self._parser.set_defaults(**defaults)
+  
+  def __repr__(self):
+    options = []
+    for opt in self._ordered_options:
+      options.append("%s = %s" % (opt, repr(self.get(opt))))
+    return "KCCOptionParser(" + ", ".join(options) + ")"
+  
+  def options(self):
+    "return the tuple of options in their preferred order"
+    return self._ordered_options
+  
+  def check(self, option, value = None, has_changed = False):
+    "see if an option is True, equal to some value, or supplied at all"
+    if option in self._options:
+      optdict = self._options[option]
+      if has_changed is True:
+        if "value" in optdict:
+          return optdict["value"] != optdict["default"]
+        return False
+      elif value is None:
+        return bool(optdict.get("value", optdict["default"]))
+      else:
+        return optdict.get("value", optdict["default"]) == value
+    return False
+  
+  def get(self, option):
+    "get the value of an option if it has one, or its default otherwise"
+    return self._options[option].get("value", self._options[option]["default"])
+  
+  def parse_args(self):
+    "parse sys.argv, returning a list of files and arguments to ignore"
+    argv = sys.argv[1:]
+    files = []
+    program_args = []
+    mutexes = ("compile", "execute", "compile_proper", "debug", "preprocess",
+               "valgrind", "shared")
+    if "--" in sys.argv:
+      program_args = sys.argv[sys.argv.index("--") + 1:]
+      argv = sys.argv[1:sys.argv.index("--")]
+    options, args = self._parser.parse_args(argv)
+    for opt in self._options:
+      self._options[opt]["value"] = getattr(options, opt)
+    if self._options["lang"].get("value", "") == "c89":
+      self._options["lang"]["value"] = LANG_C
+    if self._options["lang"].get("value", "") == "cpp":
+      self._options["lang"]["value"] = LANG_CPP
+    elif self._options["lang"].get("value", "") == "c++0x":
+      self._options["lang"]["value"] = LANG_CPP1X
+    if self._options["0x"]["value"] or self._options["1x"]["value"]:
+      self._options["lang"]["value"] = LANG_CPP1X
+    if KCC_STANDALONE:
+      self._options["nocolors"]["value"] = True
+    files = [arg for arg in args if os.path.exists(arg)]
+    if sum(1 for opt in mutexes if self.check(opt)) > 1:
+      errorstr = "only one of '%s' allowed at at time"
+      self._parser.error(errorstr % (", ".join(mutexes),))
+      sys.exit(1)
+    if self.check("gdbhelp"):
+      sys.stdout.write(GDB_HELP_STRING)
+      sys.exit(0)
+    if len(files) == 0:
+      self._parser.error("no input files")
+      sys.exit(1)
+    return files, program_args
+
+class KCCCompiler(object):
+  def __init__(self):
+    self._parser = KCCOptionParser()
+    self._files, program_args = self._parser.parse_args()
+    self._verbose("arguments parsed, got the following information:")
+    self._verbose("files: %s" % (self._files,))
+    self._verbose("program args: %s" % (program_args,))
+    self._verbose("arguments: " + repr(self._parser))
+    self._process_files()
+    self._dest = self._get_destfile_name()
+    self._language = self._get_language()
+    self._gcc_args = self._build_gcc_args()
+    self._verbose("language: %s" % (self._language,))
+    sources = ", ".join(self._files)
+    self.message("compiling '%s' as '%s'..." % (sources, self._dest))
+    if self._run_gcc():
+      if windows:
+        command = [self._dest] + program_args
+      else:
+        command = ["./" + self._dest] + program_args
+      if self._parser.check("execute"):
+        self.message("executing '%s'..." % (command,))
+        self._run_program(command, interactive = True)
+      elif self._parser.check("debug"):
+        self.message("debugging '%s' in gdb..." % (command,))
+        if len(program_args) > 0:
+          gdbargs = ["gdb", "--args"]
+        else:
+          gdbargs = ["gdb"]
+        self._run_program(gdbargs + command, interactive = True)
+      elif self._parser.check("valgrind"):
+        self.message("executing '%s' through valgrind..." % (command,))
+        self._run_program(["valgrind"] + command, interactive = True)
+    else:
+      self.error("compilation failed")
+      raise sys.exit(1)
+  
+  def _process_files(self):
+    self._verbose("checking for files that need special attention...")
+    flexes = [f for f in self._files if self._get_file_type(f) == LANG_FLEX]
+    for flexfile in flexes:
+      self._verbose("found a flex file named " + flexfile)
+      newfile = newext(flexfile, "c")
+      rc, o = self._run_program(["flex", "-o", newfile, flexfile])
+      if rc != 0:
+        self.error(o)
+        sys.exit(1)
+      self._files.remove(flexfile)
+      if not newfile in self._files:
+        self._files.append(newfile)
+  
+  def _get_destfile_name(self):
+    self._verbose("getting the destination file name...")
+    if self._parser.check("test"):
+      return "/dev/null"
+    elif self._parser.check("dest"):
+      return self._parser.get("dest")
+    elif self._parser.check("compile"):
+      return newext(self._files[0], "o")
+    elif self._parser.check("compile_proper"):
+      return newext(self._files[0], "s")
+    elif self._parser.check("preprocess"):
+      return newext(self._files[0], "ii")
+    elif self._parser.check("shared"):
+      return newext(self._files[0], "so")
+    elif windows:
+      return newext(self._files[0], "exe")
+    elif macosx:
+      return newext(self._files[0], "app")
+    return self._files[0].rpartition('.')[0]
+  
+  def _get_file_type(self, filename):
+    self._verbose("figuring out what kind of file '%s' is..." % (filename,))
+    extension = os.path.splitext(filename)[-1][1:]
+    self._verbose("extension of '%s' is '%s'" % (filename, extension))
+    if extension.lower() in ("s", "asm"):
+      return LANG_ASM
+    elif extension == "c":
+      return LANG_C
+    elif extension.lower() in ("c", "cpp", "cxx", "cc", "cp", "c++"):
+      return LANG_CPP
+    elif extension == "l":
+      return LANG_FLEX
+    return LANG_NONE
+  
+  def _get_language(self):
+    language = LANG_NONE
+    if self._parser.get("lang") != language:
+      return self._parser.get("lang")
+    for filename in self._files:
+      filetype = self._get_file_type(filename)
+      self._verbose("type of '%s' is %s" % (filename, filetype))
+      if filetype in (LANG_ASM, LANG_C, LANG_CPP):
+        if filetype != language and language != LANG_NONE:
+          return LANG_NONE
+        language = filetype
+    return language
+  
+  def _build_gcc_args(self):
+    if self._language == LANG_ASM:
+      cmd = ["gcc", "-x", "asm"]
+    elif self._language == LANG_C:
+      cmd = ["gcc", "-x", "c", "-ansi"]
+    elif self._language == LANG_C99:
+      cmd = ["gcc", "-x", "c", "-std=c99"]
+    elif self._language == LANG_CPP:
+      cmd = ["g++", "-x", "c++", "-ansi", "-fexceptions"]
+    elif self._language == LANG_CPP1X:
+      cmd = ["g++", "-x", "c++", "-std=c++0x", "-fexceptions"]
+    else:
+      cmd = ["gcc"]
+    if self._parser.check("compile"):
+      cmd.append("-c")
+    elif self._parser.check("compile_proper"):
+      cmd.append("-S")
+    elif self._parser.check("preprocess"):
+      cmd.append("-E")
+    elif self._parser.check("shared"):
+      cmd.extend(["-fPIC", "-shared"])
+    if self._parser.check("debug"):
+      cmd.append("-g")
+    if self._parser.check("optimize"):
+      cmd.extend(["-fexpensive-optimizations", "-O3"])
+    if not self._parser.check("nowarn"):
+      cmd.extend(["-Wall", "-Wextra", "-pedantic", "-Wfloat-equal",
+                  "-Wwrite-strings", "-Wshadow", "-Wpointer-arith",
+                  "-Wcast-qual", "-Wredundant-decls", "-Wtrigraphs",
+                  "-Wswitch-default", "-Wswitch-enum", "-Wundef",
+                  "-Wconversion"])
+      #if self._language in (LANG_CPP, LANG_CPP1X):
+      #  cmd.extend(["-Weffc++", "-Wabi"])
+    if self._parser.check("libs"):
+      for lib in self._parser.get("libs"):
+        cmd.extend(["-l", lib])
+    if self._parser.check("lgtk"):
+      self._verbose("calling pkg-config for libgtk")
+      rc, o = self._run_program("pkg-config --cflags --libs gtk+-2.0")
+      if rc == 0:
+        cmd.extend(o.split())
+    if self._parser.check("lgtkmm"):
+      self._verbose("calling pkg-config for libgtkmm")
+      rc, o = self._run_program("pkg-config --cflags --libs gtkmm-2.4")
+      if rc == 0:
+        cmd.extend(o.split())
+    if self._parser.check("passopts"):
+      cmd.extend(self._parser.get("passopts").split())
+    if self._dest:
+      cmd.extend(["-o", self._dest])
+    cmd.extend(self._files)
+    self._verbose(" ".join(cmd))
+    return cmd
+  
+  def _run_gcc(self):
+    self._verbose("running gcc using subprocess...")
+    gcc = Popen(self._gcc_args, stdout = PIPE, stderr = PIPE)
+    try:
+      out, err = gcc.communicate()
+      self._print_gcc_output(out, err)
+    except KeyboardInterrupt:
+      self.error("process terminated by SIGINT")
+      return False
+    if gcc.returncode < 0:
+      self.error("gcc terminated by signal %s" % (gcc.returncode,))
+    elif gcc.returncode > 0:
+      self.error("gcc returned %s exit status" % (gcc.returncode,))
+    else:
+      self.message("compilation succeeded!")
+      return True
+    self._verbose("files are of different types, using generic settings")
+  
+  def _run_program(self, command, interactive = False):
+    if isinstance(command, basestring):
+      command = command.split()
+    self._verbose("running a program: ", " ".join(command))
+    try:
+      out = ""
+      if interactive:
+        p = Popen(command, stdout = sys.stdout, stderr = sys.stderr)
+        p.wait()
+      else:
+        p = Popen(command, stdout = PIPE, stderr = STDOUT)
+        out = p.communicate()
+      if p.returncode < 0:
+        self.error("%s terminated by signal %s" % (command[0], -p.returncode))
+      elif p.returncode > 0:
+        self.warn("%s returned %s exit status" % (command[0], p.returncode))
+      else:
+        self._verbose("program exited successfully")
+      return (p.returncode, out)
+    except KeyboardInterrupt:
+      self.error("%s terminated by SIGINT" % (command[0],))
+    return (False, "")
+  
+  def _eprintln(self, *strings, **kwargs):
+    if kwargs.get("encode", False):
+      strings = encode(*strings)
+    if len(strings) > 1:
+      sys.stderr.write("%s: %s\n" % (strings[0], "".join(strings[1:])))
+    elif strings[0]:
+      sys.stderr.write("%s\n" % (strings[0],))
+  
+  def _print_gcc_output(self, out, err):
+    out, err = decode(out, err)
+    output = ("%s\n%s" % (out.strip(), err.strip())).strip()
+    if not KCC_STANDALONE:
+      level = self._parser.get("beautify")
+      color = not self._parser.get("nocolors")
+      output = kaedenn.gcc.formatter.format(output, color, level)
+    self._eprintln(output, encode = True)
+  
+  def _verbose(self, *messages):
+    if self._parser.check("verbose"):
+      for m in messages:
+        self.message(m)
+  
+  def error(self, message):
+    if self._parser.check("nocolors"):
+      self._eprintln("kcc: " + message)
+    else:
+      self._eprintln(kaedenn.errmsg.error("kcc: error: " + message))
+  
+  def notify(self, message):
+    if self._parser.check("nocolors"):
+      self._eprintln("kcc: " + message)
+    else:
+      self._eprintln(kaedenn.errmsg.notify("kcc: note: " + message))
+  
+  def warn(self, message):
+    if self._parser.check("nocolors"):
+      self._eprintln("kcc: " + message)
+    else:
+      self._eprintln(kaedenn.errmsg.warn("kcc: warning: " + message))
+  
+  def message(self, message):
+    if self._parser.check("nocolors"):
+      self._eprintln("kcc: " + message)
+    else:
+      self._eprintln(kaedenn.errmsg.message("kcc: message: " + message))
+
+if __name__ == "__main__":
+  KCCCompiler()
+
