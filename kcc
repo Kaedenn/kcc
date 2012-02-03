@@ -491,7 +491,8 @@ class KCCCompiler(object):
                   "-Wwrite-strings", "-Wshadow", "-Wpointer-arith",
                   "-Wcast-qual", "-Wredundant-decls", "-Wtrigraphs",
                   "-Wswitch-default", "-Wswitch-enum", "-Wundef",
-                  "-Wconversion"])
+                  "-Wconversion", "-Wno-non-virtual-dtor", "-Wno-switch-enum",
+                  "-Wno-long-long", "-Wno-unused-parameter"])
       #if self._language in (LANG_CPP, LANG_CPP1X):
       #  cmd.extend(["-Weffc++", "-Wabi"])
     if self._parser.check("libs"):
