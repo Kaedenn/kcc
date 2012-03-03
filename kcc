@@ -30,15 +30,7 @@ try:
   import kaedenn.errmsg
   import kaedenn.gcc.formatter
 except ImportError, e:
-  try:
-    import imp
-    imp.load_package("kaedenn", "kaedenn")
-    kaedenn.errmsg
-    kaedenn.gcc.formatter
-  except AttributeError, e:
-    KCC_STANDALONE = True
-  else:
-    KCC_STANDALONE = False
+  KCC_STANDALONE = True
 else:
   KCC_STANDALONE = False
 
@@ -129,7 +121,7 @@ class KCCOptionParser(object):
       "compile", "nocolors", "execute", "shared", "compile_proper",
       "preprocess", "debug", "optimize", "gdbhelp", "nowarn", "lang", "0x",
       "1x", "beautify", "dest", "passopts", "verbose", "libs", "lgtk",
-      "lgtkmm", "valgrind", "test"
+      "lgtkmm", "valgrind"
     )
     self._options = {
       "compile": {
@@ -232,8 +224,9 @@ class KCCOptionParser(object):
         "help": "manually specify the destination file name"
       },
       "passopts": {
-        "default": "",
+        "default": [],
         "opts": ("-p", ""),
+        "action": "append",
         "metavar": "OPTIONS",
         "help": "pass extra options to gcc; options should be in quotes"
       },
@@ -270,12 +263,6 @@ class KCCOptionParser(object):
         "opts": ("", "--valgrind"),
         "action": "store_true",
         "help": "execute the resulting program through valgrind"
-      },
-      "test": {
-        "default": False,
-        "opts": ("-t", "--test"),
-        "action": "store_true",
-        "help": "just check if the source files compile and link"
       }
     }
     self._parser = optparse.OptionParser(usage = USAGE_STRING,
@@ -416,9 +403,7 @@ class KCCCompiler(object):
   
   def _get_destfile_name(self):
     self._verbose("getting the destination file name...")
-    if self._parser.check("test"):
-      return "/dev/null"
-    elif self._parser.check("dest"):
+    if self._parser.check("dest"):
       return self._parser.get("dest")
     elif self._parser.check("compile"):
       return newext(self._files[0], "o")
@@ -474,6 +459,9 @@ class KCCCompiler(object):
       cmd = ["g++", "-x", "c++", "-std=c++0x", "-fexceptions"]
     else:
       cmd = ["gcc"]
+    # these commands could affect later commands, so do them first
+    if self._parser.check("passopts"):
+      cmd.extend(self._parser.get("passopts"))
     if self._parser.check("compile"):
       cmd.append("-c")
     elif self._parser.check("compile_proper"):
@@ -487,17 +475,12 @@ class KCCCompiler(object):
     if self._parser.check("optimize"):
       cmd.extend(["-fexpensive-optimizations", "-O3"])
     if not self._parser.check("nowarn"):
-      cmd.extend(["-Wall", "-Wextra", "-pedantic", "-Wfloat-equal",
-                  "-Wwrite-strings", "-Wshadow", "-Wpointer-arith",
-                  "-Wcast-qual", "-Wredundant-decls", "-Wtrigraphs",
-                  "-Wswitch-default", "-Wswitch-enum", "-Wundef",
-                  "-Wconversion", "-Wno-non-virtual-dtor", "-Wno-switch-enum",
-                  "-Wno-long-long", "-Wno-unused-parameter"])
-      #if self._language in (LANG_CPP, LANG_CPP1X):
-      #  cmd.extend(["-Weffc++", "-Wabi"])
-    if self._parser.check("libs"):
-      for lib in self._parser.get("libs"):
-        cmd.extend(["-l", lib])
+      cmd.extend(["-Wall", "-Wextra", "-Wfloat-equal", "-Wwrite-strings",
+                  "-Wshadow", "-Wpointer-arith", "-Wcast-qual",
+                  "-Wredundant-decls", "-Wtrigraphs", "-Wswitch-default",
+                  "-Wswitch-enum", "-Wundef", "-Wconversion", "-pedantic"])
+      if self._language in (LANG_CPP, LANG_CPP1X):
+        cmd.extend(["-Weffc++", "-Wabi"])
     if self._parser.check("lgtk"):
       self._verbose("calling pkg-config for libgtk")
       rc, o = self._run_program("pkg-config --cflags --libs gtk+-2.0")
@@ -508,11 +491,12 @@ class KCCCompiler(object):
       rc, o = self._run_program("pkg-config --cflags --libs gtkmm-2.4")
       if rc == 0:
         cmd.extend(o.split())
-    if self._parser.check("passopts"):
-      cmd.extend(self._parser.get("passopts").split())
     if self._dest:
       cmd.extend(["-o", self._dest])
     cmd.extend(self._files)
+    if self._parser.check("libs"):
+      for lib in self._parser.get("libs"):
+        cmd.extend(["-l", lib])
     self._verbose(" ".join(cmd))
     return cmd
   
